@@ -9,9 +9,23 @@ Analyst Terminal: Financial Terminal UI + 4 Tabs
 import gc
 import time
 import streamlit as st
+import requests
 import yfinance as yf
 import pandas as pd
 from datetime import datetime
+
+# Browser-like User-Agent to reduce 429 / rate-limit blocks from Yahoo
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def _stealth_session():
+    """Return a requests.Session with browser User-Agent for yfinance."""
+    s = requests.Session()
+    s.headers["User-Agent"] = USER_AGENT
+    return s
 
 # Set True to show RAM usage in sidebar (requires psutil)
 DEBUG_MODE = False
@@ -290,14 +304,15 @@ def revenue_cagr_from_financials(fin):
 
 @st.cache_data(ttl=3600, max_entries=50)
 def fetch_peer_metrics(tickers_list):
-    """Fetch P/E, EV/EBITDA, Profit Margin for a list of tickers. Returns list of dicts; safe against missing data."""
+    """Fetch P/E, EV/EBITDA, Profit Margin for a list of tickers. Uses stealth session. Returns list of dicts."""
     results = []
+    session = _stealth_session()
     for t in tickers_list:
         t = (t or "").strip().upper()
         if not t:
             continue
         try:
-            stock = yf.Ticker(t)
+            stock = yf.Ticker(t, session=session)
             info = stock.info or {}
             mcap = safe_float(info.get("marketCap"))
             ev = safe_float(info.get("enterpriseValue"))
@@ -328,17 +343,17 @@ def safe_df(df, copy=False):
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_stock_data(ticker):
     """
-    Fetch info, financials, balance_sheet, cashflow for one ticker. Cached 24h to avoid rate limits.
+    Stealth fetch: info, financials, balance_sheet, cashflow for one ticker.
+    Uses a browser-like User-Agent and retries on rate limit. Cached 24h.
     Returns dict with keys: info, financials, balance_sheet, cashflow, _fetched_at; or None on failure.
     """
     ticker = (ticker or "").strip().upper()
     if not ticker:
         return None
-    last_error = None
-    # yfinance does not expose request headers; caching + retry reduce 429s from shared IP
     for attempt in range(3):
         try:
-            stock = yf.Ticker(ticker)
+            session = _stealth_session()
+            stock = yf.Ticker(ticker, session=session)
             info = stock.info or {}
             financials = safe_df(stock.financials)
             balance_sheet = safe_df(stock.balance_sheet)
@@ -351,26 +366,32 @@ def fetch_stock_data(ticker):
                 "_fetched_at": time.time(),
             }
         except Exception as e:
-            last_error = e
             err_str = str(e).lower()
-            if "429" in err_str or "too many requests" in err_str:
-                if attempt < 2:
-                    time.sleep(2)
-                    continue
+            is_rate_limit = "429" in err_str or "too many requests" in err_str or "rate limit" in err_str
+            if attempt < 2:
+                time.sleep(2)
+                continue
             return None
     return None
 
 
 def fetch_ticker_data(ticker):
-    """Load data via fetch_stock_data (cached 24h), update session_state. Returns (success, error_message)."""
+    """
+    Load data: check session_state first (same ticker already loaded), then fetch_stock_data.
+    Saves to session_state on success. Returns (success, error_message).
+    """
     ticker = (ticker or "").strip().upper()
     if not ticker:
         return False, "Enter a ticker."
+    # Session state protection: if we already have data for this ticker, skip the API
+    if st.session_state.ticker == ticker and st.session_state.get("cached_info") is not None:
+        st.session_state.fetch_data_source = "session"
+        return True, None
     data = fetch_stock_data(ticker)
     if data is None:
         st.session_state.fetch_data_source = "fallback"
-        return False, "Rate limit or fetch failed. Showing previous data if available."
-    # New data: clear old heavy cache, then apply
+        return False, "Live data limit reached. Switched to Manual Mode."
+    # New data: clear old heavy cache, then apply and save to session_state immediately
     for k in ("cached_info", "cached_financials", "cached_balance_sheet", "cached_cashflow"):
         st.session_state.pop(k, None)
     force_garbage_collection()
@@ -420,10 +441,13 @@ with st.sidebar:
                 st.success(f"Loaded {st.session_state.ticker}")
             else:
                 st.warning(err or "Fetch failed")
+                st.caption("Enter Price, Shares, FCF in Valuation tab.")
     if st.session_state.get("fetch_data_source") == "cache":
         st.caption("📦 Using Cached Data (24h)")
     elif st.session_state.get("fetch_data_source") == "fallback":
-        st.caption("📦 Showing previous data (fetch failed)")
+        st.warning("⚠️ Live data limit reached. Switched to Manual Mode.")
+    elif st.session_state.get("fetch_data_source") == "session":
+        st.caption("📦 Loaded from session")
     st.markdown("---")
     st.caption("Sector & rates")
     st.info(f"**{st.session_state.sector}**")
@@ -519,6 +543,8 @@ tab_valuation, tab_guru, tab_datalab, tab_deep = st.tabs(["💎 Valuation", "�
 # ========== TAB 1: INTRINSIC VALUE (existing calculator) ==========
 with tab_valuation:
     st.header("Intrinsic Value Calculator")
+    if st.session_state.get("fetch_data_source") == "fallback":
+        st.warning("⚠️ Live data limit reached. Switched to Manual Mode. Enter values from 10-K below.")
     col1, col2 = st.columns([1, 2])
     with col1:
         st.caption(f"**Ticker:** {st.session_state.ticker or '—'} · Set in sidebar")
