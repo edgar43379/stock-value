@@ -103,6 +103,10 @@ if "last_op_cash" not in st.session_state:
     st.session_state.last_op_cash = None
 if "last_capex" not in st.session_state:
     st.session_state.last_capex = None
+if "operating_cash" not in st.session_state:
+    st.session_state.operating_cash = 0.0
+if "capex" not in st.session_state:
+    st.session_state.capex = 0.0
 if "show_snapshot" not in st.session_state:
     st.session_state.show_snapshot = False
 if "cached_info" not in st.session_state:
@@ -326,13 +330,12 @@ def fetch_ticker_data(ticker):
         st.session_state.def_growth, st.session_state.def_discount, st.session_state.def_terminal = g, d, t
         operating_cash, capex = info.get('operatingCashflow'), info.get('capitalExpenditures')
         st.session_state.last_op_cash, st.session_state.last_capex = operating_cash, capex
-        if operating_cash is not None and capex is not None:
-            st.session_state.fcf = safe_float(operating_cash + capex)
-            st.session_state.fcf_source = "manual"
-        else:
-            raw = info.get('freeCashflow')
-            st.session_state.fcf = safe_float(raw) if raw is not None else 0.0
-            st.session_state.fcf_source = "fallback"
+        st.session_state.operating_cash = safe_float(operating_cash)
+        st.session_state.capex = safe_float(capex)  # Yahoo often sends negative, e.g. -2B
+        st.session_state.fcf = st.session_state.operating_cash + st.session_state.capex
+        st.session_state.fcf_source = "manual" if (operating_cash is not None and capex is not None) else "fallback"
+        for k in ("ocf_input", "capex_input"):
+            st.session_state.pop(k, None)  # reset widget state so inputs show new fetched values
         total_debt, total_cash = info.get('totalDebt'), info.get('totalCash')
         st.session_state.net_debt = safe_float(total_debt) - safe_float(total_cash)
         st.session_state.cached_info = info
@@ -460,8 +463,29 @@ with tab_valuation:
         elif st.session_state.fcf_source == "fallback":
             st.caption("⚠️ FCF: Fallback — verify in 10-K")
     with col2:
-        st.caption("**Manual override:** Check vs 10-K. Edit below; values persist.")
-        fcf_input = st.number_input("Free Cash Flow ($)", value=float(st.session_state.fcf), format="%f", key="fcf")
+        st.caption("**Manual override:** Check vs 10-K. Edit OCF and CapEx; values persist.")
+        # Build Your Own FCF: OCF + CapEx (CapEx usually negative from Yahoo)
+        ocf_col, capex_col = st.columns(2)
+        with ocf_col:
+            operating_input = st.number_input(
+                "Operating Cash Flow (OCF)",
+                value=float(st.session_state.operating_cash),
+                format="%f",
+                key="ocf_input",
+            )
+        with capex_col:
+            capex_input = st.number_input(
+                "Less: CapEx",
+                value=float(st.session_state.capex),
+                format="%f",
+                key="capex_input",
+                help="Yahoo often sends this as negative (e.g. -2B).",
+            )
+        ignore_capex = st.checkbox("Ignore CapEx? (use 0)", key="ignore_capex", help="Use for service companies with low capex.")
+        capex_for_fcf = 0.0 if ignore_capex else capex_input
+        calculated_fcf = operating_input + capex_for_fcf
+        st.session_state.fcf = calculated_fcf
+        st.success(f"✅ **Free Cash Flow to Use:** {format_currency(calculated_fcf)}")
         net_debt_input = st.number_input("Net Debt ($)", value=float(st.session_state.net_debt), format="%f", key="net_debt")
         shares_input = st.number_input("Shares Outstanding", value=float(st.session_state.shares), format="%f", key="shares")
         price_input = st.number_input("Current Price ($)", value=float(st.session_state.price), format="%f", key="price")
@@ -487,7 +511,7 @@ with tab_valuation:
         future_cash_flows = []
         discount_factors = []
         for year in range(1, 6):
-            cf = fcf_input * ((1 + growth_rate) ** year)
+            cf = calculated_fcf * ((1 + growth_rate) ** year)
             future_cash_flows.append(cf)
             discount_factors.append((1 + discount_rate) ** year)
         final_year_fcf = future_cash_flows[-1]
@@ -527,7 +551,7 @@ with tab_valuation:
                 row = {}
                 for d in discount_vals:
                     iv = run_dcf(
-                        fcf_input, net_debt_input, shares_input,
+                        calculated_fcf, net_debt_input, shares_input,
                         g / 100, d / 100, terminal_growth
                     )
                     row[f"Disc {d:.1f}%"] = round(iv, 2)
