@@ -6,10 +6,18 @@ Analyst Terminal: Financial Terminal UI + 4 Tabs
 - Tabs: 💎 Valuation | 🧠 Guru Checklists | 📈 Financials | 📊 Deep Dive
 """
 
+import gc
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 from datetime import datetime
+
+# Set True to show RAM usage in sidebar (requires psutil)
+DEBUG_MODE = False
+
+def force_garbage_collection():
+    """Run gc.collect() to free memory after expensive operations."""
+    gc.collect()
 
 # Page config
 st.set_page_config(
@@ -277,7 +285,7 @@ def revenue_cagr_from_financials(fin):
     return cagr * 100
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=3600, max_entries=50)
 def fetch_peer_metrics(tickers_list):
     """Fetch P/E, EV/EBITDA, Profit Margin for a list of tickers. Returns list of dicts; safe against missing data."""
     results = []
@@ -307,11 +315,11 @@ def fetch_peer_metrics(tickers_list):
     return results
 
 
-def safe_df(df):
-    """Return DataFrame if valid and non-empty; else None."""
+def safe_df(df, copy=False):
+    """Return DataFrame if valid and non-empty; else None. Use copy=False to avoid duplicating in memory."""
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return None
-    return df
+    return df.copy() if copy else df
 
 
 def fetch_ticker_data(ticker):
@@ -319,6 +327,10 @@ def fetch_ticker_data(ticker):
     ticker = (ticker or "").strip().upper()
     if not ticker:
         return False, "Enter a ticker."
+    # Free memory: drop old heavy cached data before loading new ticker
+    for k in ("cached_info", "cached_financials", "cached_balance_sheet", "cached_cashflow"):
+        st.session_state.pop(k, None)
+    force_garbage_collection()
     try:
         stock = yf.Ticker(ticker)
         info = stock.info or {}
@@ -352,6 +364,7 @@ def fetch_ticker_data(ticker):
         st.session_state.snap_forward_pe = info.get("forwardPE")
         st.session_state.snap_peg = info.get("pegRatio")
         st.session_state.snap_beta = info.get("beta")
+        force_garbage_collection()
         return True, None
     except Exception as e:
         return False, str(e)
@@ -406,6 +419,15 @@ with st.sidebar:
         mime="text/csv",
         key="download_valuation",
     )
+    if DEBUG_MODE:
+        try:
+            import psutil
+            proc = psutil.Process()
+            rss_mb = proc.memory_info().rss / (1024 * 1024)
+            st.caption("RAM (debug)")
+            st.metric("Memory", f"{rss_mb:.1f} MB")
+        except ImportError:
+            st.caption("RAM (debug): install psutil")
 
 # --- 4. MAIN APP ---
 # Ticker-tape header: Company Name (H1) | Price / Change (H2) — same line, columns
@@ -559,6 +581,7 @@ with tab_valuation:
             sens_df = pd.DataFrame(rows, index=[f"Growth {g:.1f}%" for g in growth_vals])
             st.caption("Rows: Growth ±1%; Columns: Discount ±0.5%. Best-case (max intrinsic value) highlighted.")
             st.dataframe(sens_df.style.highlight_max(axis=None).format("{:.2f}"), use_container_width=True)
+        force_garbage_collection()
     else:
         st.session_state.export_intrinsic_value = None
         st.session_state.export_upside_pct = None
