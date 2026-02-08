@@ -1,280 +1,338 @@
 """
-The Free Intrinsic Value Calculator
-A 100% free, local stock valuation dashboard using Streamlit and yfinance.
+The "Smart" Intrinsic Value Calculator
+Features:
+- yfinance (Price/Shares) + Manual Overrides (FCF/Debt)
+- Automatic Sector Detection + Dynamic Default Assumptions by Sector
+- Historical Reality Check: 5-Year Revenue CAGR from stock.financials
+- Sensitivity Analysis: 3x3 matrix (Growth ±1%, Discount ±0.5%)
+- Export to CSV: Download Model from sidebar ({ticker}_valuation.csv)
 """
 
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import plotly.express as px
 
 # Page config
 st.set_page_config(
-    page_title="Free Intrinsic Value Calculator",
-    page_icon="📊",
+    page_title="Smart Valuation Tool",
+    page_icon="🧠",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
 
-# Initialize session state for manual overrides
+# --- 1. SESSION STATE SETUP ---
+# We store defaults here so sliders can update automatically
 if "fcf" not in st.session_state:
-    st.session_state.fcf = None
+    st.session_state.fcf = 0.0
 if "shares" not in st.session_state:
-    st.session_state.shares = None
+    st.session_state.shares = 0.0
 if "price" not in st.session_state:
-    st.session_state.price = None
-if "last_ticker" not in st.session_state:
-    st.session_state.last_ticker = ""
+    st.session_state.price = 0.0
+if "net_debt" not in st.session_state:
+    st.session_state.net_debt = 0.0
+if "sector" not in st.session_state:
+    st.session_state.sector = "Unknown"
+    
+# DEFAULT RATES (These will change based on sector)
+if "def_growth" not in st.session_state:
+    st.session_state.def_growth = 5.0
+if "def_discount" not in st.session_state:
+    st.session_state.def_discount = 9.0
+if "def_terminal" not in st.session_state:
+    st.session_state.def_terminal = 2.5
+if "ticker" not in st.session_state:
+    st.session_state.ticker = "KO"
+if "export_intrinsic_value" not in st.session_state:
+    st.session_state.export_intrinsic_value = None
+if "export_upside_pct" not in st.session_state:
+    st.session_state.export_upside_pct = None
+if "fcf_source" not in st.session_state:
+    st.session_state.fcf_source = None  # "manual" | "fallback" | None
+if "last_op_cash" not in st.session_state:
+    st.session_state.last_op_cash = None
+if "last_capex" not in st.session_state:
+    st.session_state.last_capex = None
 
-
-def fetch_stock_data(ticker: str) -> tuple:
-    """Fetch FCF, shares outstanding, and market price from yfinance."""
+# --- 2. HELPERS & SECTOR LOGIC ---
+def safe_float(value, default=0.0):
+    """Handle None or invalid values; return default so the app never crashes on math."""
+    if value is None:
+        return default
     try:
-        stock = yf.Ticker(ticker.upper().strip())
-        info = stock.info
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
-        fcf = info.get("freeCashflow") or info.get("operatingCashflow")
-        shares = info.get("sharesOutstanding")
-        price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
 
-        return (fcf, shares, price)
+def get_sector_defaults(sector):
+    """Returns (Growth %, Discount %, Terminal %) based on yfinance sector.
+    Fallback: Growth=5%, Discount=9%, Terminal=2.5%."""
+    defaults = {
+        "Technology": (12.0, 9.0, 3.0),           # High growth, med risk
+        "Consumer Defensive": (4.5, 7.0, 2.5),    # Low growth, low risk (Coke, P&G)
+        "Consumer Cyclical": (5.0, 10.0, 2.5),    # Econ sensitive (Ford, Amazon)
+        "Financial Services": (5.0, 10.0, 2.5),   # Banks (JPM)
+        "Healthcare": (5.0, 8.0, 2.5),            # Stable (JNJ)
+        "Energy": (3.0, 9.0, 2.0),                # Slow, cyclical (Exxon)
+        "Utilities": (3.0, 6.5, 2.5),             # Very safe (Duke Energy)
+        "Industrials": (4.0, 9.0, 2.5),           # General (Boeing, CAT)
+        "Real Estate": (3.5, 8.0, 2.5),           # REITs
+        "Communication Services": (8.0, 9.0, 2.5),  # Google, Meta
+    }
+    return defaults.get(sector, (5.0, 9.0, 2.5))
+
+
+def run_dcf(fcf, net_debt, shares, growth_pct, discount_pct, terminal_pct):
+    """Run DCF and return intrinsic value per share. Rates in decimal (e.g. 0.09)."""
+    if shares <= 0:
+        return 0.0
+    g, r, t = growth_pct, discount_pct, terminal_pct
+    future_cfs = [fcf * ((1 + g) ** y) for y in range(1, 6)]
+    discount_factors = [(1 + r) ** y for y in range(1, 6)]
+    pv_cfs = sum(cf / df for cf, df in zip(future_cfs, discount_factors))
+    final_fcf = future_cfs[-1]
+    tv = (final_fcf * (1 + t)) / (r - t) if r > t else 0.0
+    pv_tv = tv / ((1 + r) ** 5)
+    ev = pv_cfs + pv_tv
+    equity = ev - net_debt
+    return equity / shares
+
+
+def revenue_cagr_5y(ticker_symbol):
+    """Fetch last 5 years revenue from yfinance financials; return CAGR as percentage or None."""
+    try:
+        stock = yf.Ticker(ticker_symbol)
+        fin = stock.financials
+        if fin is None or fin.empty:
+            return None
+        # Find revenue row (yfinance uses 'Total Revenue' or 'Revenue')
+        rev_row = None
+        for label in ("Total Revenue", "Revenue", "Total revenues"):
+            if label in fin.index:
+                rev_row = fin.loc[label]
+                break
+        if rev_row is None:
+            return None
+        # Columns are typically dates (newest first); we need oldest and newest for 5Y CAGR
+        rev_row = rev_row.dropna()
+        if len(rev_row) < 2:
+            return None
+        rev_row = rev_row.sort_index()
+        oldest = safe_float(rev_row.iloc[0])
+        newest = safe_float(rev_row.iloc[-1])
+        if oldest <= 0:
+            return None
+        cagr = (newest / oldest) ** (1 / 5) - 1
+        return cagr * 100
     except Exception:
-        return (None, None, None)
+        return None
 
-
-def calculate_intrinsic_value(
-    fcf: float,
-    shares: float,
-    net_debt: float,
-    growth_rate: float,
-    discount_rate: float,
-    terminal_growth: float,
-) -> tuple[float, float, float]:
-    """
-    DCF model: 5-year projection + terminal value.
-    Returns (ev_per_share, net_debt_per_share, intrinsic_value_per_share).
-    """
-    if not fcf or not shares or fcf <= 0 or shares <= 0:
-        return (0.0, 0.0, 0.0)
-
-    growth = growth_rate / 100
-    discount = discount_rate / 100
-    term_growth = terminal_growth / 100
-    net_debt_val = float(net_debt or 0)
-
-    pv_cf = 0.0
-    cf = float(fcf)
-    for year in range(1, 6):
-        cf *= 1 + growth
-        pv_cf += cf / ((1 + discount) ** year)
-
-    terminal_value = cf * (1 + term_growth) / (discount - term_growth)
-    pv_terminal = terminal_value / ((1 + discount) ** 5)
-    enterprise_value = pv_cf + pv_terminal
-    equity_value = enterprise_value - net_debt_val
-
-    ev_per_share = enterprise_value / shares
-    net_debt_per_share = net_debt_val / shares
-    intrinsic_value_per_share = equity_value / shares
-
-    return (ev_per_share, net_debt_per_share, intrinsic_value_per_share)
-
-
-# ============ SIDEBAR (Educational) ============
+# --- 3. SIDEBAR ---
 with st.sidebar:
-    st.title("📚 Learn the Basics")
-    st.markdown("---")
-    st.subheader("Free Cash Flow (FCF)")
-    st.markdown("""
-    **Free Cash Flow** is the cash a company generates after paying for operations 
-    and capital expenditures (like equipment or buildings).
-    
-    - **Why it matters:** It shows how much money is left for shareholders, 
-    debt repayment, or reinvestment.
-    - **Higher is better:** More FCF = more flexibility and potential dividends.
-    """)
+    st.title("🧠 Smart Settings")
+    st.info(f"Detected Sector: **{st.session_state.sector}**")
 
     st.markdown("---")
-    st.subheader("Discount Rate (Risk)")
-    st.markdown("""
-    The **Discount Rate** converts future cash flows into today's value.
-    
-    - **Higher rate = more conservative:** You're saying future money is riskier.
-    - **Typical range:** 8–12% for stable companies, 10–15% for riskier ones.
-    - **Think of it as:** Your required return for taking on the investment risk.
-    """)
+    st.caption("**Auto-Recommended Rates:**")
+    st.write(f"Growth: {st.session_state.def_growth}%")
+    st.write(f"Discount: {st.session_state.def_discount}%")
+    st.write(f"Terminal: {st.session_state.def_terminal}%")
 
     st.markdown("---")
-    st.subheader("Growth Rate")
-    st.markdown("""
-    How fast you expect cash flow to grow in the next 5 years. 
-    Be realistic—most companies grow 2–8% annually.
-    """)
+    st.subheader("Download Model")
+    iv = st.session_state.export_intrinsic_value
+    up = st.session_state.export_upside_pct
+    ticker_safe = (st.session_state.ticker or "KO").strip() or "KO"
+    csv_lines = [
+        "Metric,Value",
+        f"Ticker,{ticker_safe}",
+        f"Price,{st.session_state.price}",
+        f"FCF,{st.session_state.fcf}",
+        f"Net Debt,{st.session_state.net_debt}",
+        f"Shares,{st.session_state.shares}",
+        f"Intrinsic Value,{iv if iv is not None else ''}",
+        f"Upside/Downside %,{up if up is not None else ''}",
+    ]
+    csv_string = "\n".join(csv_lines)
+    st.download_button(
+        label="Download Model (CSV)",
+        data=csv_string,
+        file_name=f"{ticker_safe}_valuation.csv",
+        mime="text/csv",
+        key="download_valuation",
+    )
 
-    st.markdown("---")
-    st.subheader("Terminal Growth Rate")
-    st.markdown("""
-    Long-term perpetual growth after year 5. Usually 1–3%, 
-    roughly in line with GDP growth.
-    """)
+# --- 4. MAIN APP ---
+st.title("🧠 Smart Intrinsic Value Calculator")
 
-
-# ============ MAIN CONTENT ============
-st.title("📊 The Free Intrinsic Value Calculator")
-st.caption("100% free • No API keys • All data via yfinance")
-
-st.markdown("---")
-
-# ----- 1. INPUT SECTION -----
-st.header("1️⃣ Input")
-col1, col2, col3 = st.columns(3)
+# INPUT SECTION
+st.header("1. Financial Inputs")
+col1, col2 = st.columns([1, 2])
 
 with col1:
-    ticker = st.text_input("Stock Ticker", value="KO", placeholder="e.g., AAPL, MSFT, KO").strip().upper()
-    if ticker:
-        if st.session_state.last_ticker != ticker:
-            st.session_state.fcf = None
-            st.session_state.shares = None
-            st.session_state.price = None
-            st.session_state.last_ticker = ticker
-        if st.button("Fetch Data"):
-            fcf_raw, shares_raw, price_raw = fetch_stock_data(ticker)
-            st.session_state.fcf = fcf_raw
-            st.session_state.shares = shares_raw
-            st.session_state.price = price_raw
-            st.session_state.last_ticker = ticker
-            st.rerun()
+    ticker = st.text_input("Stock Ticker", value=st.session_state.ticker, key="ticker_input").upper()
+    st.session_state.ticker = ticker
+
+    if st.button("Fetch Data (yfinance)"):
+        with st.spinner(f"Analyzing {ticker}..."):
+            try:
+                stock = yf.Ticker(ticker)
+                info = stock.info or {}
+
+                # 1. Basics (safe fallbacks)
+                st.session_state.price = safe_float(
+                    info.get('currentPrice') or info.get('regularMarketPrice')
+                )
+                st.session_state.shares = safe_float(info.get('sharesOutstanding'))
+                st.session_state.sector = info.get('sector') or "Unknown"
+
+                # 2. Sector auto-detection → update slider defaults
+                g, d, t = get_sector_defaults(st.session_state.sector)
+                st.session_state.def_growth = g
+                st.session_state.def_discount = d
+                st.session_state.def_terminal = t
+
+                # 3. Robust Unlevered FCF: Primary = operatingCashflow + capitalExpenditures (CapEx usually negative)
+                operating_cash = info.get('operatingCashflow')
+                capex = info.get('capitalExpenditures')
+                st.session_state.last_op_cash = operating_cash
+                st.session_state.last_capex = capex
+                if operating_cash is not None and capex is not None:
+                    st.session_state.fcf = safe_float(operating_cash + capex)
+                    st.session_state.fcf_source = "manual"
+                else:
+                    raw_fcf = info.get('freeCashflow')
+                    if raw_fcf is not None:
+                        st.session_state.fcf = safe_float(raw_fcf)
+                        st.session_state.fcf_source = "fallback"
+                    else:
+                        st.session_state.fcf = 0.0
+                        st.session_state.fcf_source = "fallback"
+
+                # 4. Net Debt: totalDebt - totalCash (missing keys → 0)
+                total_debt = info.get('totalDebt')
+                total_cash = info.get('totalCash')
+                st.session_state.net_debt = safe_float(total_debt) - safe_float(total_cash)
+
+                st.success(f"Loaded {ticker}! Sector: {st.session_state.sector}")
+
+            except Exception as e:
+                st.error(f"Could not load data for **{ticker}**. Check the ticker or try again. Details: {e}")
 
 with col2:
-    fcf_val = st.session_state.fcf
-    shares_val = st.session_state.shares
-    price_val = st.session_state.price
-
-    # Handle None/missing - default to 0 and allow manual input
-    fcf_display = fcf_val if fcf_val is not None else 0
-    shares_display = shares_val if shares_val is not None else 0
-    price_display = price_val if price_val is not None else 0
-
-    def safe_int(val):
-        if val is None or val == 0:
-            return 0
-        return int(val) if val == int(val) else int(val)
+    st.warning("⚠️ **Manual override:** Verify and adjust these numbers against the company's 10-K before relying on the valuation.")
+    if st.session_state.fcf_source == "manual":
+        st.info("✅ FCF was calculated as **Unlevered**: Operating Cash Flow + CapEx. You can overwrite below.")
+    elif st.session_state.fcf_source == "fallback":
+        st.warning("⚠️ FCF could not be calculated from Operating Cash Flow + CapEx; fallback or default was used. Check and overwrite if needed.")
+    st.write("**Debug (raw from yfinance):** Operating Cash Flow =", st.session_state.last_op_cash, " | Capital Expenditures =", st.session_state.last_capex)
+    st.caption("👇 Edit any field; values persist when you move sliders.")
 
     fcf_input = st.number_input(
-        "Free Cash Flow ($)",
-        value=safe_int(fcf_display),
-        step=1_000_000,
-        format="%d",
-        help="Manually enter if yfinance returns missing data.",
-    )
-    shares_input = st.number_input(
-        "Shares Outstanding",
-        value=safe_int(shares_display),
-        step=1_000_000,
-        format="%d",
-        help="Manually enter if yfinance returns missing data.",
+        "Free Cash Flow ($)", value=float(st.session_state.fcf), format="%f", key="fcf"
     )
     net_debt_input = st.number_input(
-        "Net Debt ($)",
-        value=0,
-        step=1_000_000,
-        format="%d",
-        help="Total Debt minus Cash. If Cash > Debt, enter a negative number.",
+        "Net Debt ($)", value=float(st.session_state.net_debt), format="%f", key="net_debt"
     )
-
-with col3:
-    market_price = st.number_input(
-        "Market Price ($)",
-        value=float(price_display) if price_display else 0.0,
-        step=0.01,
-        format="%.2f",
-        help="Current stock price. Edit if needed.",
+    shares_input = st.number_input(
+        "Shares Outstanding", value=float(st.session_state.shares), format="%f", key="shares"
     )
-    st.metric("Current Market Price", f"${market_price:,.2f}")
+    price_input = st.number_input(
+        "Current Price ($)", value=float(st.session_state.price), format="%f", key="price"
+    )
 
 st.markdown("---")
 
-# ----- 2. ASSUMPTIONS SECTION -----
-st.header("2️⃣ Assumptions (The Learning Part)")
+# VALUATION SECTION
+st.header("2. Assumptions (Auto-filled by Sector)")
+
+# Historical Reality Check (5-Year Revenue CAGR) — wrapped so app never crashes
+try:
+    cagr_pct = revenue_cagr_5y(st.session_state.ticker)
+    if cagr_pct is not None:
+        st.caption(f"📉 **5-Year Revenue CAGR:** **{cagr_pct:.1f}%**")
+    else:
+        st.caption("📉 **5-Year Revenue CAGR:** Historical data unavailable")
+except Exception:
+    st.caption("📉 **5-Year Revenue CAGR:** Historical data unavailable")
+
+# SLIDERS (Now connected to session_state defaults)
 col_a, col_b, col_c = st.columns(3)
 
 with col_a:
-    growth_rate = st.slider(
-        "Growth Rate (Next 5 Years) (%)",
-        min_value=0.0,
-        max_value=20.0,
-        value=5.0,
-        step=0.5,
-        help="Expected annual FCF growth.",
-    )
-
+    growth_rate = st.slider("Growth Rate (Next 5 Years)", 0.0, 30.0, st.session_state.def_growth, 0.5) / 100
 with col_b:
-    discount_rate = st.slider(
-        "Discount Rate (Risk) (%)",
-        min_value=5.0,
-        max_value=15.0,
-        value=10.0,
-        step=0.5,
-        help="Your required return / risk adjustment.",
-    )
-
+    discount_rate = st.slider("Discount Rate (Risk)", 4.0, 15.0, st.session_state.def_discount, 0.5) / 100
 with col_c:
-    terminal_growth = st.slider(
-        "Terminal Growth Rate (%)",
-        min_value=1.0,
-        max_value=4.0,
-        value=2.5,
-        step=0.25,
-        help="Perpetual growth after year 5.",
-    )
+    terminal_growth = st.slider("Terminal Growth", 0.0, 5.0, st.session_state.def_terminal, 0.1) / 100
 
-st.markdown("---")
+# CALCULATIONS
+if shares_input > 0:
+    # 1. Project Cash Flows
+    future_cash_flows = []
+    discount_factors = []
+    
+    for year in range(1, 6):
+        cf = fcf_input * ((1 + growth_rate) ** year)
+        future_cash_flows.append(cf)
+        discount_factors.append((1 + discount_rate) ** year)
+        
+    # 2. Terminal Value
+    final_year_fcf = future_cash_flows[-1]
+    tv = (final_year_fcf * (1 + terminal_growth)) / (discount_rate - terminal_growth)
+    pv_tv = tv / ((1 + discount_rate) ** 5)
+    
+    # 3. Sum It Up
+    enterprise_value = sum([cf / df for cf, df in zip(future_cash_flows, discount_factors)]) + pv_tv
+    equity_value = enterprise_value - net_debt_input
+    intrinsic_value = equity_value / shares_input
+    
+    # DISPLAY RESULTS
+    st.header("3. Results")
+    
+    # The Bridge
+    st.markdown(f"""
+    #### Valuation Bridge
+    | Metric | Value per Share |
+    | :--- | :--- |
+    | **Enterprise Value** | **${(enterprise_value/shares_input):.2f}** |
+    | *(-) Net Debt* | *${(net_debt_input/shares_input):.2f}* |
+    | **(=) Equity Value** | **${intrinsic_value:.2f}** |
+    """)
+    
+    # Big Metric
+    delta = intrinsic_value - price_input
+    upside_pct = (delta / price_input) * 100 if price_input else 0.0
+    st.session_state.export_intrinsic_value = intrinsic_value
+    st.session_state.export_upside_pct = upside_pct
 
-# ----- 3. OUTPUT -----
-st.header("3️⃣ Result")
-
-ev_per_share, net_debt_per_share, intrinsic_value = calculate_intrinsic_value(
-    fcf_input, shares_input, net_debt_input, growth_rate, discount_rate, terminal_growth
-)
-
-if intrinsic_value > 0:
-    st.caption("**Valuation breakdown**")
-    st.markdown(
-        f"Enterprise Value per Share: **${ev_per_share:,.2f}**  \n"
-        f"(-) Net Debt per Share: **${net_debt_per_share:,.2f}**  \n"
-        f"(=) Equity Value per Share: **${intrinsic_value:,.2f}**"
-    )
-    st.markdown("")
-    st.metric("Intrinsic Value per Share", f"${intrinsic_value:,.2f}")
-
-    # Status message
-    if market_price and market_price > 0:
-        pct_diff = ((intrinsic_value - market_price) / market_price) * 100
-        if pct_diff > 0:
-            st.success(f"✅ **Undervalued by {pct_diff:.1f}%** — Intrinsic value is higher than market price.")
-        else:
-            st.error(f"⚠️ **Overvalued by {abs(pct_diff):.1f}%** — Market price exceeds intrinsic value.")
+    st.metric(label="Intrinsic Value per Share", value=f"${intrinsic_value:.2f}", delta=f"{delta:.2f}")
+    
+    if delta > 0:
+        st.success(f"✅ UNDERVALUED by {upside_pct:.1f}%")
     else:
-        st.info("Enter a market price above to see undervalued/overvalued status.")
+        st.error(f"❌ OVERVALUED by {abs(upside_pct):.1f}%")
 
-    # Bar chart
-    if market_price and market_price > 0:
-        df_chart = pd.DataFrame(
-            {
-                "Metric": ["Intrinsic Value", "Current Price"],
-                "Value ($)": [intrinsic_value, market_price],
-            }
-        )
-        fig = px.bar(
-            df_chart,
-            x="Metric",
-            y="Value ($)",
-            color="Metric",
-            color_discrete_map={"Intrinsic Value": "#28a745", "Current Price": "#6c757d"},
-            title="Intrinsic Value vs Current Price",
-        )
-        fig.update_layout(showlegend=False, xaxis_title="", yaxis_title="Value ($)")
-        st.plotly_chart(fig, use_container_width=True)
+    # --- 4. Sensitivity Analysis ---
+    st.header("4. Sensitivity Analysis")
+    with st.expander("What-if: Intrinsic Value by Growth vs Discount Rate", expanded=True):
+        growth_pct_user = growth_rate * 100
+        discount_pct_user = discount_rate * 100
+        growth_vals = [growth_pct_user - 1.0, growth_pct_user, growth_pct_user + 1.0]
+        discount_vals = [discount_pct_user - 0.5, discount_pct_user, discount_pct_user + 0.5]
+        rows = []
+        for g in growth_vals:
+            row = {}
+            for d in discount_vals:
+                iv = run_dcf(
+                    fcf_input, net_debt_input, shares_input,
+                    g / 100, d / 100, terminal_growth
+                )
+                row[f"Disc {d:.1f}%"] = round(iv, 2)
+            rows.append(row)
+        sens_df = pd.DataFrame(rows, index=[f"Growth {g:.1f}%" for g in growth_vals])
+        st.caption("Rows: Growth ±1%; Columns: Discount ±0.5%. Best-case (max intrinsic value) highlighted.")
+        st.dataframe(sens_df.style.highlight_max(axis=None).format("{:.2f}"), use_container_width=True)
 else:
-    st.warning("⚠️ Enter valid Free Cash Flow and Shares Outstanding to see the intrinsic value.")
-    st.info("If yfinance returns missing data, use the manual input fields above.")
+    st.session_state.export_intrinsic_value = None
+    st.session_state.export_upside_pct = None
+    st.warning("Enter valid data to see the valuation.")
