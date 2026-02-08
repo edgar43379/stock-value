@@ -7,6 +7,7 @@ Analyst Terminal: Financial Terminal UI + 4 Tabs
 """
 
 import gc
+import time
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -127,6 +128,8 @@ if "cached_cashflow" not in st.session_state:
     st.session_state.cached_cashflow = None
 if "company_name" not in st.session_state:
     st.session_state.company_name = ""
+if "fetch_data_source" not in st.session_state:
+    st.session_state.fetch_data_source = None  # "live" | "cache" | "fallback"
 
 # --- 2. HELPERS (safe_float, format_currency, sector, DCF) ---
 def safe_float(value, default=0.0):
@@ -322,52 +325,87 @@ def safe_df(df, copy=False):
     return df.copy() if copy else df
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_stock_data(ticker):
+    """
+    Fetch info, financials, balance_sheet, cashflow for one ticker. Cached 24h to avoid rate limits.
+    Returns dict with keys: info, financials, balance_sheet, cashflow, _fetched_at; or None on failure.
+    """
+    ticker = (ticker or "").strip().upper()
+    if not ticker:
+        return None
+    last_error = None
+    # yfinance does not expose request headers; caching + retry reduce 429s from shared IP
+    for attempt in range(3):
+        try:
+            stock = yf.Ticker(ticker)
+            info = stock.info or {}
+            financials = safe_df(stock.financials)
+            balance_sheet = safe_df(stock.balance_sheet)
+            cashflow = safe_df(stock.cashflow)
+            return {
+                "info": info,
+                "financials": financials,
+                "balance_sheet": balance_sheet,
+                "cashflow": cashflow,
+                "_fetched_at": time.time(),
+            }
+        except Exception as e:
+            last_error = e
+            err_str = str(e).lower()
+            if "429" in err_str or "too many requests" in err_str:
+                if attempt < 2:
+                    time.sleep(2)
+                    continue
+            return None
+    return None
+
+
 def fetch_ticker_data(ticker):
-    """Single yfinance fetch: update all session_state. Returns (success, error_message)."""
+    """Load data via fetch_stock_data (cached 24h), update session_state. Returns (success, error_message)."""
     ticker = (ticker or "").strip().upper()
     if not ticker:
         return False, "Enter a ticker."
-    # Free memory: drop old heavy cached data before loading new ticker
+    data = fetch_stock_data(ticker)
+    if data is None:
+        st.session_state.fetch_data_source = "fallback"
+        return False, "Rate limit or fetch failed. Showing previous data if available."
+    # New data: clear old heavy cache, then apply
     for k in ("cached_info", "cached_financials", "cached_balance_sheet", "cached_cashflow"):
         st.session_state.pop(k, None)
     force_garbage_collection()
-    try:
-        stock = yf.Ticker(ticker)
-        info = stock.info or {}
-        st.session_state.price = safe_float(info.get('currentPrice') or info.get('regularMarketPrice'))
-        st.session_state.shares = safe_float(info.get('sharesOutstanding'))
-        st.session_state.sector = info.get('sector') or "Unknown"
-        st.session_state.company_name = info.get('shortName') or info.get('longName') or ticker
-        g, d, t = get_sector_defaults(st.session_state.sector)
-        st.session_state.def_growth, st.session_state.def_discount, st.session_state.def_terminal = g, d, t
-        operating_cash, capex = info.get('operatingCashflow'), info.get('capitalExpenditures')
-        st.session_state.last_op_cash, st.session_state.last_capex = operating_cash, capex
-        st.session_state.operating_cash = safe_float(operating_cash)
-        st.session_state.capex = safe_float(capex)  # Yahoo often sends negative, e.g. -2B
-        st.session_state.fcf = st.session_state.operating_cash + st.session_state.capex
-        st.session_state.fcf_source = "manual" if (operating_cash is not None and capex is not None) else "fallback"
-        for k in ("ocf_input", "capex_input"):
-            st.session_state.pop(k, None)  # reset widget state so inputs show new fetched values
-        total_debt, total_cash = info.get('totalDebt'), info.get('totalCash')
-        st.session_state.net_debt = safe_float(total_debt) - safe_float(total_cash)
-        st.session_state.cached_info = info
-        try:
-            st.session_state.cached_financials = safe_df(stock.financials)
-            st.session_state.cached_balance_sheet = safe_df(stock.balance_sheet)
-            st.session_state.cached_cashflow = safe_df(stock.cashflow)
-        except Exception:
-            st.session_state.cached_financials = st.session_state.cached_balance_sheet = st.session_state.cached_cashflow = None
-        st.session_state.show_snapshot = True
-        st.session_state.snap_market_cap = info.get("marketCap")
-        st.session_state.snap_prev_close = info.get("regularMarketPreviousClose")
-        st.session_state.snap_trailing_pe = info.get("trailingPE")
-        st.session_state.snap_forward_pe = info.get("forwardPE")
-        st.session_state.snap_peg = info.get("pegRatio")
-        st.session_state.snap_beta = info.get("beta")
-        force_garbage_collection()
-        return True, None
-    except Exception as e:
-        return False, str(e)
+    info = data["info"]
+    st.session_state.price = safe_float(info.get("currentPrice") or info.get("regularMarketPrice"))
+    st.session_state.shares = safe_float(info.get("sharesOutstanding"))
+    st.session_state.sector = info.get("sector") or "Unknown"
+    st.session_state.company_name = info.get("shortName") or info.get("longName") or ticker
+    g, d, t = get_sector_defaults(st.session_state.sector)
+    st.session_state.def_growth, st.session_state.def_discount, st.session_state.def_terminal = g, d, t
+    operating_cash, capex = info.get("operatingCashflow"), info.get("capitalExpenditures")
+    st.session_state.last_op_cash, st.session_state.last_capex = operating_cash, capex
+    st.session_state.operating_cash = safe_float(operating_cash)
+    st.session_state.capex = safe_float(capex)
+    st.session_state.fcf = st.session_state.operating_cash + st.session_state.capex
+    st.session_state.fcf_source = "manual" if (operating_cash is not None and capex is not None) else "fallback"
+    for k in ("ocf_input", "capex_input"):
+        st.session_state.pop(k, None)
+    total_debt, total_cash = info.get("totalDebt"), info.get("totalCash")
+    st.session_state.net_debt = safe_float(total_debt) - safe_float(total_cash)
+    st.session_state.cached_info = info
+    st.session_state.cached_financials = data.get("financials")
+    st.session_state.cached_balance_sheet = data.get("balance_sheet")
+    st.session_state.cached_cashflow = data.get("cashflow")
+    st.session_state.show_snapshot = True
+    st.session_state.snap_market_cap = info.get("marketCap")
+    st.session_state.snap_prev_close = info.get("regularMarketPreviousClose")
+    st.session_state.snap_trailing_pe = info.get("trailingPE")
+    st.session_state.snap_forward_pe = info.get("forwardPE")
+    st.session_state.snap_peg = info.get("pegRatio")
+    st.session_state.snap_beta = info.get("beta")
+    # Cache badge: data from 24h cache if _fetched_at is more than 10s ago
+    st.session_state.fetch_data_source = "cache" if (time.time() - data.get("_fetched_at", 0)) > 10 else "live"
+    force_garbage_collection()
+    return True, None
 
 
 # --- 3. PRO SIDEBAR (Ticker + Fetch top, Status, Download bottom) ---
@@ -381,7 +419,11 @@ with st.sidebar:
             if ok:
                 st.success(f"Loaded {st.session_state.ticker}")
             else:
-                st.error(err or "Fetch failed")
+                st.warning(err or "Fetch failed")
+    if st.session_state.get("fetch_data_source") == "cache":
+        st.caption("📦 Using Cached Data (24h)")
+    elif st.session_state.get("fetch_data_source") == "fallback":
+        st.caption("📦 Showing previous data (fetch failed)")
     st.markdown("---")
     st.caption("Sector & rates")
     st.info(f"**{st.session_state.sector}**")
